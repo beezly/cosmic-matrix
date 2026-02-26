@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Cosmic Matrix
+Comment=Matrix chat client for COSMIC
+Exec=cosmic-matrix
+Icon=com.cosmic.CosmicMatrix
+Terminal=false
+Type=Application
+Categories=Network;InstantMessaging;Chat;
+Keywords=matrix;chat;messaging;

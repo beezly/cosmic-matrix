@@ -1,0 +1,36 @@
+[package]
+name = "cosmic-matrix"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+description = "A native COSMIC Matrix chat client"
+
+[[bin]]
+name = "cosmic-matrix"
+path = "src/main.rs"
+
+[dependencies]
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", features = [
+    "tokio",
+    "wayland",
+    "wgpu",
+    "winit",
+    "xdg-portal",
+] }
+matrix-sdk = { version = "0.9", default-features = false, features = [
+    "e2e-encryption",
+    "sqlite",
+    "rustls-tls",
+    "markdown",
+] }
+matrix-sdk-ui = { version = "0.9", default-features = false }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "5"
+ruma = "0.12"
+futures = "0.3"
+chrono = "0.4"
+mime_guess = "2"

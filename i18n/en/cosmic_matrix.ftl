@@ -1,0 +1,12 @@
+app-title = Cosmic Matrix
+login = Log In
+logout = Log Out
+homeserver = Homeserver URL
+username = Username
+password = Password
+rooms = Rooms
+no-rooms = No rooms yet
+send = Send
+loading = Loading...
+error-login = Login failed
+error-sync = Sync error
