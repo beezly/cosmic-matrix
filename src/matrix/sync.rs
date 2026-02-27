@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use cosmic::iced::futures::SinkExt;
@@ -22,13 +23,11 @@ pub fn sync_subscription(client: Arc<Client>) -> Subscription<Message> {
                 let filter = FilterDefinition::with_lazy_loading();
                 let settings = SyncSettings::default().filter(filter.into());
 
-                // Run initial sync and collect rooms
                 match client.sync_once(settings.clone()).await {
                     Ok(response) => {
                         let rooms = collect_rooms(&client).await;
                         let _ = output.send(Message::RoomsUpdated(rooms)).await;
 
-                        // Emit incoming events for the initial sync
                         for (room_id, update) in &response.rooms.join {
                             let new_items = extract_new_items_from_events(
                                 &client, room_id, &update.timeline.events,
@@ -40,10 +39,8 @@ pub fn sync_subscription(client: Arc<Client>) -> Subscription<Message> {
                             }
                         }
 
-                        // Emit incoming to-device verification requests
                         emit_verification_requests(&response.to_device, &mut output).await;
 
-                        // Continue syncing
                         let mut settings = settings.token(response.next_batch);
                         loop {
                             match client.sync_once(settings.clone()).await {
@@ -85,7 +82,6 @@ pub fn sync_subscription(client: Arc<Client>) -> Subscription<Message> {
                     }
                 }
 
-                // Keep subscription alive
                 futures::future::pending::<()>().await;
             }
         }),
@@ -114,8 +110,26 @@ async fn extract_new_items_from_events(
     items
 }
 
+/// Collect the set of room IDs that are marked as DMs in m.direct account data.
+async fn collect_dm_room_ids(client: &Client) -> HashSet<String> {
+    use matrix_sdk::ruma::events::direct::DirectEventContent;
+    let mut dm_ids = HashSet::new();
+    if let Ok(Some(event)) = client.account().account_data::<DirectEventContent>().await {
+        if let Ok(content) = event.deserialize() {
+            for room_ids in content.0.values() {
+                for rid in room_ids {
+                    dm_ids.insert(rid.to_string());
+                }
+            }
+        }
+    }
+    dm_ids
+}
+
 async fn collect_rooms(client: &Client) -> Vec<RoomEntry> {
     let mut entries = Vec::new();
+
+    let dm_ids = collect_dm_room_ids(client).await;
 
     for room in client.joined_rooms() {
         let name = room
@@ -124,6 +138,8 @@ async fn collect_rooms(client: &Client) -> Vec<RoomEntry> {
             .unwrap_or_else(|| room.room_id().to_string());
 
         let counts = room.unread_notification_counts();
+        let unread_count = counts.notification_count;
+        let mention_count = counts.highlight_count;
 
         let is_encrypted = room.is_encrypted().await.unwrap_or(false);
 
@@ -131,13 +147,24 @@ async fn collect_rooms(client: &Client) -> Vec<RoomEntry> {
 
         let avatar_letter = name.chars().next().unwrap_or('#');
 
+        let is_dm = dm_ids.contains(room.room_id().as_str());
+
+        // Fetch room tags
+        let (is_favourite, is_low_priority) = match room.tags().await {
+            Ok(Some(tags)) => {
+                let fav = tags.contains_key(&matrix_sdk::ruma::events::tag::TagName::Favorite);
+                let low = tags.contains_key(&matrix_sdk::ruma::events::tag::TagName::LowPriority);
+                (fav, low)
+            }
+            _ => (false, false),
+        };
+
         let (last_message, last_message_ts) = room
             .latest_event()
             .and_then(|ev| {
                 let timeline_ev = ev.event().raw().deserialize().ok()?;
                 let ts_millis: i64 = timeline_ev.origin_server_ts().0.into();
                 if let AnySyncTimelineEvent::MessageLike(ref msg_ev) = timeline_ev {
-                    // Use empty map here — sidebar previews don't need resolved names
                     if let Some(TimelineItem::Message(m)) =
                         convert_message_event(msg_ev, &std::collections::HashMap::new())
                     {
@@ -151,22 +178,18 @@ async fn collect_rooms(client: &Client) -> Vec<RoomEntry> {
         entries.push(RoomEntry {
             room_id: room.room_id().to_owned(),
             name,
-            unread_count: counts.notification_count,
+            unread_count,
+            mention_count,
             is_encrypted,
             topic,
             last_message,
             last_message_ts,
             avatar_letter,
+            is_favourite,
+            is_low_priority,
+            is_dm,
         });
     }
-
-    // Sort: unread first, then most recent activity, then alphabetically
-    entries.sort_by(|a, b| {
-        b.unread_count
-            .cmp(&a.unread_count)
-            .then_with(|| b.last_message_ts.cmp(&a.last_message_ts))
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
 
     entries
 }

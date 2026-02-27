@@ -13,7 +13,7 @@ use matrix_sdk::Client;
 
 use mime_guess;
 
-use crate::config;
+use crate::config::{self, SortMode};
 use crate::matrix;
 use crate::matrix::verification as matrix_verification;
 use crate::message::{
@@ -71,6 +71,7 @@ impl cosmic::Application for App {
         core.window.content_container = false;
 
         let has_session = config::load_session().is_some();
+        let settings = config::load_settings();
 
         let app = App {
             core,
@@ -82,7 +83,12 @@ impl cosmic::Application for App {
             login_state: LoginState::default(),
             login_password: String::new(),
             own_user_id: None,
-            rooms_state: RoomsState::default(),
+            rooms_state: {
+                let mut rs = RoomsState::default();
+                rs.sort_mode = settings.sort_mode;
+                rs.sections_collapsed = settings.sections_collapsed;
+                rs
+            },
             timeline_state: TimelineState::default(),
             client: None,
             homeserver: String::new(),
@@ -377,6 +383,39 @@ impl cosmic::Application for App {
                 tracing::warn!("Failed to fetch image for event {event_id}");
             }
 
+
+            // -- Room list controls --
+            Message::SetSortMode(mode) => {
+                self.rooms_state.sort_mode = mode;
+                let mut settings = config::load_settings();
+                settings.sort_mode = self.rooms_state.sort_mode.clone();
+                let _ = config::save_settings(&settings);
+            }
+            Message::ToggleSection(key) => {
+                self.rooms_state.toggle_section(&key);
+                let mut settings = config::load_settings();
+                settings.sections_collapsed = self.rooms_state.sections_collapsed.clone();
+                let _ = config::save_settings(&settings);
+            }
+            Message::ToggleFavourite(room_id) => {
+                let is_fav = self
+                    .rooms_state
+                    .rooms
+                    .iter()
+                    .find(|r| r.room_id == room_id)
+                    .map(|r| r.is_favourite)
+                    .unwrap_or(false);
+                if let Some(ref client) = self.client {
+                    let client = Arc::clone(client);
+                    return cosmic::task::future(async move {
+                        toggle_favourite_tag((*client).clone(), room_id, is_fav).await
+                    });
+                }
+            }
+            Message::FavouriteToggled(room_id, _is_fav) => {
+                tracing::debug!("Favourite toggled for {room_id}");
+            }
+
             Message::LoadMoreHistory => {
                 let token = match self.timeline_state.pagination_token.clone() {
                     Some(t) => t,
@@ -664,9 +703,30 @@ impl App {
                 .on_clear(Message::RoomFilterChanged(String::new())),
         );
 
-        // Room list
-        let filtered = self.rooms_state.filtered_rooms();
-        if filtered.is_empty() {
+        // Sort mode selector
+        let sort_label = match self.rooms_state.sort_mode {
+            SortMode::RecentActivity => "Recent",
+            SortMode::Alphabetical => "A\u{2013}Z",
+        };
+        let other_sort = match self.rooms_state.sort_mode {
+            SortMode::RecentActivity => SortMode::Alphabetical,
+            SortMode::Alphabetical => SortMode::RecentActivity,
+        };
+        sidebar_col = sidebar_col.push(
+            widget::row()
+                .push(widget::text::caption(format!("Sort: {sort_label}")))
+                .push(widget::horizontal_space())
+                .push(
+                    widget::button::text("Switch")
+                        .on_press(Message::SetSortMode(other_sort))
+                        .padding([2, spacing.space_xs]),
+                )
+                .align_y(Alignment::Center),
+        );
+
+        // Sectioned room list
+        let sections = self.rooms_state.sections();
+        if sections.is_empty() {
             sidebar_col = sidebar_col.push(
                 widget::container(widget::text::body("No rooms"))
                     .width(Length::Fill)
@@ -675,68 +735,107 @@ impl App {
             );
         } else {
             let mut room_list = widget::column().spacing(2);
-            for room in &filtered {
-                let is_selected = self
-                    .rooms_state
-                    .selected
-                    .as_ref()
-                    .is_some_and(|s| s == &room.room_id);
-
-                let mut row = widget::row()
-                    .spacing(spacing.space_xs)
-                    .align_y(Alignment::Center);
-
-                // Avatar letter
-                row = row.push(
-                    widget::container(widget::text::heading(
-                        room.avatar_letter.to_string(),
-                    ))
-                    .width(Length::Fixed(32.0))
-                    .height(Length::Fixed(32.0))
-                    .align_x(Alignment::Center)
-                    .align_y(Alignment::Center),
+            for section in &sections {
+                let collapse_icon = if section.collapsed { "\u{25b6}" } else { "\u{25bc}" };
+                let section_key = section.key.to_string();
+                room_list = room_list.push(
+                    widget::button::custom(
+                        widget::row()
+                            .push(widget::text::caption(collapse_icon))
+                            .push(widget::text::caption(section.label))
+                            .spacing(spacing.space_xxs)
+                            .align_y(Alignment::Center),
+                    )
+                    .on_press(Message::ToggleSection(section_key))
+                    .width(Length::Fill)
+                    .class(cosmic::theme::Button::Text),
                 );
 
-                // Room name + last message preview
-                let mut info_col = widget::column().spacing(2);
-                info_col = info_col.push(widget::text::body(room.name.clone()));
-                if let Some(ref preview) = room.last_message {
-                    let truncated = if preview.len() > 60 {
-                        format!("{}…", &preview[..60])
-                    } else {
-                        preview.clone()
+                if section.collapsed {
+                    continue;
+                }
+
+                for room_id in &section.rooms {
+                    let room = match self.rooms_state.rooms.iter().find(|r| &r.room_id == room_id) {
+                        Some(r) => r,
+                        None => continue,
                     };
-                    info_col = info_col.push(widget::text::caption(truncated));
-                } else if room.is_encrypted {
-                    info_col = info_col.push(widget::text::caption("Encrypted"));
-                }
-                row = row.push(info_col);
 
-                row = row.push(widget::horizontal_space());
+                    let is_selected = self
+                        .rooms_state
+                        .selected
+                        .as_ref()
+                        .is_some_and(|s| s == &room.room_id);
 
-                if room.unread_count > 0 {
+                    let mut row = widget::row()
+                        .spacing(spacing.space_xs)
+                        .align_y(Alignment::Center);
+
                     row = row.push(
-                        widget::container(widget::text::caption(
-                            room.unread_count.to_string(),
+                        widget::container(widget::text::heading(
+                            room.avatar_letter.to_string(),
                         ))
-                        .padding([2, 6]),
+                        .width(Length::Fixed(32.0))
+                        .height(Length::Fixed(32.0))
+                        .align_x(Alignment::Center)
+                        .align_y(Alignment::Center),
                     );
+
+                    let mut info_col = widget::column().spacing(2);
+                    if room.mention_count > 0 {
+                        info_col = info_col.push(widget::text::heading(room.name.clone()));
+                    } else {
+                        info_col = info_col.push(widget::text::body(room.name.clone()));
+                    }
+                    if let Some(ref preview) = room.last_message {
+                        let truncated = if preview.len() > 50 {
+                            format!("{}\u{2026}", &preview[..50])
+                        } else {
+                            preview.clone()
+                        };
+                        info_col = info_col.push(widget::text::caption(truncated));
+                    } else if room.is_encrypted {
+                        info_col = info_col.push(widget::text::caption("Encrypted"));
+                    }
+                    row = row.push(info_col);
+                    row = row.push(widget::horizontal_space());
+
+                    let fav_label = if room.is_favourite { "\u{2605}" } else { "\u{2606}" };
+                    let fav_room_id = room.room_id.clone();
+                    row = row.push(
+                        widget::button::text(fav_label)
+                            .on_press(Message::ToggleFavourite(fav_room_id))
+                            .padding([0, 2]),
+                    );
+
+                    if room.mention_count > 0 {
+                        row = row.push(
+                            widget::container(
+                                widget::text::heading(room.mention_count.to_string()),
+                            )
+                            .padding([2, 6]),
+                        );
+                    } else if room.unread_count > 0 {
+                        row = row.push(
+                            widget::container(widget::text::caption("\u{2022}"))
+                                .padding([2, 4]),
+                        );
+                    }
+
+                    let room_id_clone = room.room_id.clone();
+                    let btn = if is_selected {
+                        widget::button::custom(row)
+                            .on_press(Message::SelectRoom(room_id_clone))
+                            .width(Length::Fill)
+                            .class(cosmic::theme::Button::Standard)
+                    } else {
+                        widget::button::custom(row)
+                            .on_press(Message::SelectRoom(room_id_clone))
+                            .width(Length::Fill)
+                            .class(cosmic::theme::Button::Text)
+                    };
+                    room_list = room_list.push(btn);
                 }
-
-                let room_id = room.room_id.clone();
-                let btn = if is_selected {
-                    widget::button::custom(row)
-                        .on_press(Message::SelectRoom(room_id))
-                        .width(Length::Fill)
-                        .class(cosmic::theme::Button::Standard)
-                } else {
-                    widget::button::custom(row)
-                        .on_press(Message::SelectRoom(room_id))
-                        .width(Length::Fill)
-                        .class(cosmic::theme::Button::Text)
-                };
-
-                room_list = room_list.push(btn);
             }
             sidebar_col =
                 sidebar_col.push(widget::scrollable(room_list).height(Length::Fill));
@@ -1023,6 +1122,35 @@ async fn load_more_history(
         Err(e) => {
             tracing::error!("Failed to load history: {e}");
             Message::HistoryLoaded(room_id.clone(), Vec::new(), None)
+        }
+    }
+}
+
+async fn toggle_favourite_tag(
+    client: matrix_sdk::Client,
+    room_id: matrix_sdk::ruma::OwnedRoomId,
+    currently_favourite: bool,
+) -> Message {
+    let room = match client.get_room(&room_id) {
+        Some(r) => r,
+        None => return Message::None,
+    };
+    let tag = matrix_sdk::ruma::events::tag::TagName::Favorite;
+    if currently_favourite {
+        match room.remove_tag(tag).await {
+            Ok(_) => Message::FavouriteToggled(room_id, false),
+            Err(e) => {
+                tracing::error!("Failed to remove favourite: {e}");
+                Message::None
+            }
+        }
+    } else {
+        match room.set_tag(tag, matrix_sdk::ruma::events::tag::TagInfo::new()).await {
+            Ok(_) => Message::FavouriteToggled(room_id, true),
+            Err(e) => {
+                tracing::error!("Failed to set favourite: {e}");
+                Message::None
+            }
         }
     }
 }
