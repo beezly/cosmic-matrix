@@ -3,6 +3,8 @@ use matrix_sdk::ruma::events::room::MediaSource;
 use matrix_sdk::ruma::{OwnedRoomId, OwnedUserId};
 use matrix_sdk::Client;
 
+use crate::config::SortMode;
+
 /// Wrapper for matrix_sdk::Client that implements Debug.
 #[derive(Clone)]
 pub struct MatrixClient(pub Client);
@@ -82,6 +84,10 @@ pub enum Message {
     // -- Room list --
     SelectRoom(OwnedRoomId),
     RoomFilterChanged(String),
+    SetSortMode(SortMode),
+    ToggleFavourite(OwnedRoomId),
+    FavouriteToggled(OwnedRoomId, bool),
+    ToggleSection(String), // section key
 
     // -- Timeline --
     TimelineUpdated(OwnedRoomId, Vec<TimelineItem>, Option<String>),
@@ -142,12 +148,21 @@ pub struct LoginSuccess {
 pub struct RoomEntry {
     pub room_id: OwnedRoomId,
     pub name: String,
+    /// Total unread notification count.
     pub unread_count: u64,
+    /// Highlight/mention count (subset of unread_count).
+    pub mention_count: u64,
     pub is_encrypted: bool,
     pub topic: Option<String>,
     pub last_message: Option<String>,
     pub last_message_ts: Option<u64>,
     pub avatar_letter: char,
+    /// Room has the m.favourite Matrix tag.
+    pub is_favourite: bool,
+    /// Room has the m.lowpriority Matrix tag.
+    pub is_low_priority: bool,
+    /// Room is a direct message (appears in m.direct account data).
+    pub is_dm: bool,
 }
 
 #[derive(Clone, Debug)]
