@@ -1579,10 +1579,14 @@ async fn fetch_backup_keys_for_room(
 ) -> Message {
     let backups = client.encryption().backups();
     if backups.are_enabled().await {
-        if let Err(e) = backups.download_room_keys_for_room(&room_id).await {
-            tracing::warn!("Failed to download backup keys for {room_id}: {e}");
-        } else {
-            tracing::info!("Downloaded backup keys for {room_id}");
+        match backups.download_room_keys_for_room(&room_id).await {
+            Ok(_) => {
+                tracing::info!("Downloaded backup keys for {room_id}, reloading timeline");
+                return load_timeline_for_room(client, &room_id).await;
+            }
+            Err(e) => {
+                tracing::warn!("Failed to download backup keys for {room_id}: {e}");
+            }
         }
     }
     Message::None
