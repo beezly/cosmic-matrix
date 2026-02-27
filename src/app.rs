@@ -285,7 +285,7 @@ impl cosmic::Application for App {
             // -- Timeline --
             Message::TimelineUpdated(room_id, items, token) => {
                 if self.timeline_state.room_id.as_ref() == Some(&room_id) {
-                    self.timeline_state.set_timeline(room_id, items, token);
+                    self.timeline_state.set_timeline(room_id.clone(), items, token);
                     let mut tasks: Vec<cosmic::app::Task<Message>> = vec![snap_to(
                         TIMELINE_SCROLLABLE_ID.clone(),
                         RelativeOffset::END,
@@ -301,6 +301,19 @@ impl cosmic::Application for App {
                             &self.avatars,
                             client,
                         ));
+                        // Send read receipt for last event to clear unread count
+                        if let Some(last_id) = last_message_event_id(&self.timeline_state.items) {
+                            let c = client.clone();
+                            let rid = room_id.clone();
+                            tasks.push(cosmic::task::future(async move {
+                                send_read_receipt(&c, &rid, &last_id).await
+                            }));
+                        }
+                    }
+                    // Optimistically clear unread badge
+                    if let Some(room) = self.rooms_state.rooms.iter_mut().find(|r| r.room_id == room_id) {
+                        room.unread_count = 0;
+                        room.mention_count = 0;
                     }
                     return Task::batch(tasks);
                 }
@@ -329,6 +342,23 @@ impl cosmic::Application for App {
                             RelativeOffset::END,
                         )];
                         tasks.extend(extra_tasks);
+                        // Send read receipt for latest event when user is at bottom
+                        if let (Some(ref client), Some(ref rid)) = (&self.client, &self.timeline_state.room_id) {
+                            if let Some(last_id) = last_message_event_id(&self.timeline_state.items) {
+                                let c = client.clone();
+                                let rid2 = rid.clone();
+                                tasks.push(cosmic::task::future(async move {
+                                    send_read_receipt(&c, &rid2, &last_id).await
+                                }));
+                            }
+                        }
+                        // Optimistically clear unread badge for current room
+                        if let Some(rid) = self.timeline_state.room_id.clone() {
+                            if let Some(room) = self.rooms_state.rooms.iter_mut().find(|r| r.room_id == rid) {
+                                room.unread_count = 0;
+                                room.mention_count = 0;
+                            }
+                        }
                         return Task::batch(tasks);
                     } else if !extra_tasks.is_empty() {
                         return Task::batch(extra_tasks);
@@ -1415,4 +1445,42 @@ async fn toggle_favourite_tag(
             }
         }
     }
+}
+
+/// Returns the event_id of the last real message in a timeline item list.
+fn last_message_event_id(items: &[crate::message::TimelineItem]) -> Option<String> {
+    items.iter().rev().find_map(|item| {
+        if let crate::message::TimelineItem::Message(msg) = item {
+            if !msg.event_id.is_empty() {
+                return Some(msg.event_id.clone());
+            }
+        }
+        None
+    })
+}
+
+async fn send_read_receipt(
+    client: &matrix_sdk::Client,
+    room_id: &matrix_sdk::ruma::OwnedRoomId,
+    event_id: &str,
+) -> Message {
+    use matrix_sdk::ruma::api::client::receipt::create_receipt::v3::ReceiptType;
+    use matrix_sdk::ruma::events::receipt::ReceiptThread;
+    use matrix_sdk::ruma::OwnedEventId;
+
+    let room = match client.get_room(room_id) {
+        Some(r) => r,
+        None => return Message::None,
+    };
+    if let Ok(eid) = OwnedEventId::try_from(event_id) {
+        // Send m.read receipt to clear server-side unread count
+        let _ = room
+            .send_single_receipt(ReceiptType::Read, ReceiptThread::Unthreaded, eid.clone())
+            .await;
+        // Send m.fully_read marker so other clients know the read position
+        let _ = room
+            .send_single_receipt(ReceiptType::FullyRead, ReceiptThread::Unthreaded, eid)
+            .await;
+    }
+    Message::None
 }
