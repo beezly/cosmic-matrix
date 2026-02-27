@@ -84,12 +84,6 @@ impl RoomsState {
         }
 
         let sort_fn = |a: &&RoomEntry, b: &&RoomEntry| -> std::cmp::Ordering {
-            // Within any section, unread rooms sort to the top
-            let a_unread = a.unread_count > 0 || a.mention_count > 0;
-            let b_unread = b.unread_count > 0 || b.mention_count > 0;
-            if a_unread != b_unread {
-                return b_unread.cmp(&a_unread);
-            }
             match self.sort_mode {
                 SortMode::Alphabetical => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
                 SortMode::RecentActivity => b
