@@ -93,16 +93,16 @@ async fn extract_new_items_from_events(
     room_id: &matrix_sdk::ruma::OwnedRoomId,
     events: &[matrix_sdk::deserialized_responses::SyncTimelineEvent],
 ) -> Vec<TimelineItem> {
-    let display_names = if let Some(room) = client.get_room(room_id) {
-        crate::matrix::timeline::build_display_names(&room).await
+    let (display_names, avatar_urls) = if let Some(room) = client.get_room(room_id) {
+        crate::matrix::timeline::build_member_info(&room).await
     } else {
-        std::collections::HashMap::new()
+        (std::collections::HashMap::new(), std::collections::HashMap::new())
     };
 
     let mut items = Vec::new();
     for ev in events {
         if let Ok(AnySyncTimelineEvent::MessageLike(msg_ev)) = ev.raw().deserialize() {
-            if let Some(item) = convert_message_event(&msg_ev, &display_names) {
+            if let Some(item) = convert_message_event(&msg_ev, &display_names, &avatar_urls) {
                 items.push(item);
             }
         }
@@ -158,6 +158,7 @@ async fn collect_rooms(client: &Client) -> Vec<RoomEntry> {
             }
             _ => (false, false),
         };
+        let avatar_url = room.avatar_url().map(|u| u.to_string());
 
         let (last_message, last_message_ts) = room
             .latest_event()
@@ -165,8 +166,9 @@ async fn collect_rooms(client: &Client) -> Vec<RoomEntry> {
                 let timeline_ev = ev.event().raw().deserialize().ok()?;
                 let ts_millis: i64 = timeline_ev.origin_server_ts().0.into();
                 if let AnySyncTimelineEvent::MessageLike(ref msg_ev) = timeline_ev {
+                    // Use empty maps here — sidebar previews don't need resolved names/avatars
                     if let Some(TimelineItem::Message(m)) =
-                        convert_message_event(msg_ev, &std::collections::HashMap::new())
+                        convert_message_event(msg_ev, &std::collections::HashMap::new(), &std::collections::HashMap::new())
                     {
                         return Some((Some(m.body), Some(ts_millis as u64)));
                     }
@@ -188,6 +190,7 @@ async fn collect_rooms(client: &Client) -> Vec<RoomEntry> {
             is_favourite,
             is_low_priority,
             is_dm,
+            avatar_url,
         });
     }
 
