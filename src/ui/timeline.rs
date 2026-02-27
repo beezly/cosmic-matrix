@@ -18,6 +18,7 @@ pub fn timeline_view<'a>(
     state: &'a TimelineState,
     images: &'a HashMap<String, ImageHandle>,
     avatars: &'a HashMap<String, ImageHandle>,
+    active_room_id: Option<&'a matrix_sdk::ruma::OwnedRoomId>,
 ) -> Element<'a, Message> {
     let spacing = cosmic::theme::spacing();
 
@@ -52,7 +53,7 @@ pub fn timeline_view<'a>(
         );
     } else {
         for item in &state.items {
-            col = col.push(render_timeline_item(item, images, avatars));
+            col = col.push(render_timeline_item(item, images, avatars, active_room_id));
         }
     }
 
@@ -68,11 +69,12 @@ fn render_timeline_item<'a>(
     item: &'a TimelineItem,
     images: &'a HashMap<String, ImageHandle>,
     avatars: &'a HashMap<String, ImageHandle>,
+    active_room_id: Option<&'a matrix_sdk::ruma::OwnedRoomId>,
 ) -> Element<'a, Message> {
     let spacing = cosmic::theme::spacing();
 
     match item {
-        TimelineItem::Message(msg) => render_message(msg, images, avatars),
+        TimelineItem::Message(msg) => render_message(msg, images, avatars, active_room_id),
         TimelineItem::DateSeparator(date) => {
             widget::container(
                 widget::row()
@@ -120,6 +122,7 @@ fn render_message<'a>(
     msg: &'a TimelineMessage,
     images: &'a HashMap<String, ImageHandle>,
     avatars: &'a HashMap<String, ImageHandle>,
+    active_room_id: Option<&'a matrix_sdk::ruma::OwnedRoomId>,
 ) -> Element<'a, Message> {
     let spacing = cosmic::theme::spacing();
 
@@ -258,6 +261,20 @@ fn render_message<'a>(
         if !msg.body.is_empty() {
             col = col.push(widget::text::caption(msg.body.as_str()));
         }
+    } else if msg.body.starts_with("ð Unable to decrypt") {
+        let mut retry_row = widget::row()
+            .push(widget::text::caption(msg.body.as_str()))
+            .spacing(spacing.space_xs)
+            .align_y(Alignment::Center);
+        if let Some(rid) = active_room_id {
+            let rid = rid.clone();
+            retry_row = retry_row.push(
+                widget::button::text("Retry")
+                    .on_press(Message::RetryDecryption(rid))
+                    .padding([0, 4]),
+            );
+        }
+        col = col.push(retry_row);
     } else {
         col = col.push(widget::text::body(msg.body.clone()));
     }
