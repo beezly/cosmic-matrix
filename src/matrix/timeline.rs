@@ -16,7 +16,7 @@ pub async fn load_room_timeline(
         .await
         .map_err(|e| format!("Failed to load messages: {e}"))?;
 
-    let display_names = build_display_names(room).await;
+    let (display_names, avatar_urls) = build_member_info(room).await;
 
     let mut items = Vec::new();
     let mut last_date: Option<chrono::NaiveDate> = None;
@@ -37,7 +37,7 @@ pub async fn load_room_timeline(
 
             match ev {
                 AnySyncTimelineEvent::MessageLike(msg_ev) => {
-                    if let Some(item) = convert_message_event(&msg_ev, &display_names) {
+                    if let Some(item) = convert_message_event(&msg_ev, &display_names, &avatar_urls) {
                         items.push(item);
                     }
                 }
@@ -56,15 +56,24 @@ pub async fn load_room_timeline(
     Ok((items, messages.end))
 }
 
-/// Fetch all joined members from the local store and return a user_id → display name map.
-pub async fn build_display_names(room: &Room) -> HashMap<String, String> {
-    let mut map = HashMap::new();
+/// Fetch all joined members and return (display_name_map, avatar_url_map).
+/// avatar_url_map values are mxc:// URI strings.
+pub async fn build_member_info(room: &Room) -> (HashMap<String, String>, HashMap<String, Option<String>>) {
+    let mut display_names = HashMap::new();
+    let mut avatar_urls = HashMap::new();
     if let Ok(members) = room.members_no_sync(RoomMemberships::JOIN).await {
         for member in members {
-            map.insert(member.user_id().to_string(), member.name().to_owned());
+            let uid = member.user_id().to_string();
+            display_names.insert(uid.clone(), member.name().to_owned());
+            avatar_urls.insert(uid, member.avatar_url().map(|u| u.to_string()));
         }
     }
-    map
+    (display_names, avatar_urls)
+}
+
+/// Kept for call sites that only need display names (e.g. history loading).
+pub async fn build_display_names(room: &Room) -> HashMap<String, String> {
+    build_member_info(room).await.0
 }
 
 fn strip_reply_fallback(body: &str) -> (Option<(String, String)>, String) {
@@ -95,6 +104,7 @@ fn strip_reply_fallback(body: &str) -> (Option<(String, String)>, String) {
 pub fn convert_message_event(
     event: &ruma::events::AnySyncMessageLikeEvent,
     display_names: &HashMap<String, String>,
+    avatar_urls: &HashMap<String, Option<String>>,
 ) -> Option<TimelineItem> {
     use ruma::events::AnySyncMessageLikeEvent;
 
@@ -106,6 +116,10 @@ pub fn convert_message_event(
                 .get(&sender)
                 .cloned()
                 .unwrap_or_else(|| original.sender.localpart().to_string());
+
+            let sender_avatar_url = avatar_urls
+                .get(&sender)
+                .and_then(|v| v.clone());
 
             let ts_millis: i64 = original.origin_server_ts.0.into();
             let datetime =
@@ -149,6 +163,7 @@ pub fn convert_message_event(
                 reply_to_sender,
                 reply_to_body,
                 image: image_content,
+                sender_avatar_url,
             }))
         }
         AnySyncMessageLikeEvent::RoomEncrypted(_) => {
@@ -163,6 +178,7 @@ pub fn convert_message_event(
                 reply_to_sender: None,
                 reply_to_body: None,
                 image: None,
+                sender_avatar_url: None,
             }))
         }
         _ => None,

@@ -1,3 +1,4 @@
+use cosmic::iced::widget::image::Handle as ImageHandle;
 use cosmic::iced::{Alignment, Length};
 use cosmic::prelude::*;
 use cosmic::widget;
@@ -8,12 +9,35 @@ pub fn room_header_view<'a>(
     room_name: &'a str,
     is_encrypted: bool,
     topic: Option<&'a str>,
+    avatar: Option<&'a ImageHandle>,
 ) -> Element<'a, Message> {
     let spacing = cosmic::theme::spacing();
 
     let mut row = widget::row()
         .spacing(spacing.space_xs)
         .align_y(Alignment::Center);
+
+    // Room avatar or placeholder
+    if let Some(handle) = avatar {
+        row = row.push(
+            widget::container(
+                cosmic::iced::widget::image(handle.clone())
+                    .width(Length::Fixed(32.0))
+                    .height(Length::Fixed(32.0)),
+            )
+            .width(Length::Fixed(32.0))
+            .height(Length::Fixed(32.0)),
+        );
+    } else {
+        let letter = room_name.chars().next().unwrap_or('#').to_string();
+        row = row.push(
+            widget::container(widget::text::heading(letter))
+                .width(Length::Fixed(32.0))
+                .height(Length::Fixed(32.0))
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center),
+        );
+    }
 
     row = row.push(widget::text::title4(room_name.to_string()));
 

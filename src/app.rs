@@ -20,13 +20,15 @@ use crate::message::{
     CrossSigningStatus, LoginSuccess, MatrixClient, Message, TimelineItem, VerificationInfo,
     VerificationPhase, VerificationStateUpdate,
 };
-use matrix_sdk::media::{MediaFormat, MediaRequestParameters};
+use matrix_sdk::media::{MediaFormat, MediaRequestParameters, MediaThumbnailSettings};
+use matrix_sdk::ruma::UInt;
 use crate::state::rooms::RoomsState;
 use crate::state::timeline::TimelineState;
 use crate::ui::login::{self, LoginState};
 use crate::ui::timeline::TIMELINE_SCROLLABLE_ID;
 use crate::ui::{composer, room_header, timeline as timeline_ui};
 use crate::ui::verification as verification_ui;
+use crate::ui::profile as profile_ui;
 use cosmic::iced::widget::scrollable::{snap_to, RelativeOffset};
 
 enum AppView {
@@ -48,8 +50,14 @@ pub struct App {
     cross_signing_status: CrossSigningStatus,
     active_verification: Option<VerificationInfo>,
     pending_incoming: Option<(String, String)>, // (flow_id, sender)
-    /// Fetched image data keyed by event_id, stored as a pre-built image Handle.
+    /// Fetched inline image data keyed by event_id.
     images: HashMap<String, ImageHandle>,
+    /// Fetched avatar data keyed by mxc:// URI string.
+    avatars: HashMap<String, ImageHandle>,
+    /// Own profile avatar, if fetched.
+    own_avatar: Option<ImageHandle>,
+    /// Whether the profile panel is visible.
+    show_profile_panel: bool,
 }
 
 impl cosmic::Application for App {
@@ -96,6 +104,9 @@ impl cosmic::Application for App {
             active_verification: None,
             pending_incoming: None,
             images: HashMap::new(),
+            avatars: HashMap::new(),
+            own_avatar: None,
+            show_profile_panel: false,
         };
 
         let task = if has_session {
@@ -156,7 +167,6 @@ impl cosmic::Application for App {
                     Ok((matrix_client, success)) => {
                         tracing::info!("Logged in as {}", success.user_id);
                         self.homeserver = self.login_state.homeserver.clone();
-                        // Save password for UIA bootstrap, then clear from login form
                         self.login_password = self.login_state.password.clone();
                         self.login_state.password.clear();
                         self.own_user_id = Some(success.user_id.clone());
@@ -164,16 +174,22 @@ impl cosmic::Application for App {
                         self.view = AppView::Main;
 
                         let client = Arc::clone(self.client.as_ref().unwrap());
+                        let client2 = Arc::clone(&client);
                         let uid = success.user_id.to_string();
                         let pw = Some(self.login_password.clone());
-                        return cosmic::task::future(async move {
-                            matrix_verification::bootstrap_cross_signing(
-                                (*client).clone(),
-                                uid,
-                                pw,
-                            )
-                            .await
-                        });
+                        return Task::batch(vec![
+                            cosmic::task::future(async move {
+                                matrix_verification::bootstrap_cross_signing(
+                                    (*client).clone(),
+                                    uid,
+                                    pw,
+                                )
+                                .await
+                            }),
+                            cosmic::task::future(async move {
+                                fetch_own_avatar((*client2).clone()).await
+                            }),
+                        ]);
                     }
                     Err(e) => {
                         self.login_state.error = Some(e);
@@ -184,23 +200,27 @@ impl cosmic::Application for App {
                 tracing::info!("Session restored");
                 self.client = Some(Arc::new(matrix_client.0));
                 self.view = AppView::Main;
-                // Retrieve own user ID from client
                 self.own_user_id = self
                     .client
                     .as_ref()
                     .and_then(|c| c.user_id().map(|u| u.to_owned()));
 
                 let client = Arc::clone(self.client.as_ref().unwrap());
+                let client2 = Arc::clone(&client);
                 let uid = self
                     .own_user_id
                     .as_ref()
                     .map(|u| u.to_string())
                     .unwrap_or_default();
-                return cosmic::task::future(async move {
-                    // No password for restored sessions; try without auth
-                    matrix_verification::bootstrap_cross_signing((*client).clone(), uid, None)
-                        .await
-                });
+                return Task::batch(vec![
+                    cosmic::task::future(async move {
+                        matrix_verification::bootstrap_cross_signing((*client).clone(), uid, None)
+                            .await
+                    }),
+                    cosmic::task::future(async move {
+                        fetch_own_avatar((*client2).clone()).await
+                    }),
+                ]);
             }
 
             Message::Logout => {
@@ -215,6 +235,9 @@ impl cosmic::Application for App {
                 self.timeline_state = TimelineState::default();
                 self.login_state = LoginState::default();
                 self.images.clear();
+                self.avatars.clear();
+                self.own_avatar = None;
+                self.show_profile_panel = false;
                 self.view = AppView::Login;
             }
 
@@ -224,7 +247,15 @@ impl cosmic::Application for App {
             }
             Message::RoomsUpdated(rooms) => {
                 tracing::debug!("Got {} rooms", rooms.len());
+                // Spawn avatar fetches for rooms that have an avatar_url not yet cached
+                let mut tasks: Vec<cosmic::app::Task<Message>> = Vec::new();
+                if let Some(ref client) = self.client {
+                    tasks.extend(spawn_avatar_fetches_for_rooms(&rooms, &self.avatars, client));
+                }
                 self.rooms_state.update_rooms(rooms);
+                if !tasks.is_empty() {
+                    return Task::batch(tasks);
+                }
             }
             Message::SyncError(e) => {
                 tracing::error!("Sync error: {e}");
@@ -265,6 +296,11 @@ impl cosmic::Application for App {
                             &self.images,
                             client,
                         ));
+                        tasks.extend(spawn_avatar_fetches_for_timeline(
+                            &self.timeline_state.items,
+                            &self.avatars,
+                            client,
+                        ));
                     }
                     return Task::batch(tasks);
                 }
@@ -278,10 +314,10 @@ impl cosmic::Application for App {
                         self.timeline_state.items.push(TimelineItem::UnreadMarker);
                         self.timeline_state.unread_marker_inserted = true;
                     }
-                    let mut image_tasks: Vec<cosmic::app::Task<Message>> = Vec::new();
+                    let mut extra_tasks: Vec<cosmic::app::Task<Message>> = Vec::new();
                     if let Some(ref client) = self.client {
-                        image_tasks =
-                            spawn_image_fetches(&new_items, &self.images, client);
+                        extra_tasks.extend(spawn_image_fetches(&new_items, &self.images, client));
+                        extra_tasks.extend(spawn_avatar_fetches_for_timeline(&new_items, &self.avatars, client));
                     }
                     self.timeline_state.items.extend(new_items);
                     matrix::timeline::apply_continuation_markers(
@@ -292,10 +328,10 @@ impl cosmic::Application for App {
                             TIMELINE_SCROLLABLE_ID.clone(),
                             RelativeOffset::END,
                         )];
-                        tasks.extend(image_tasks);
+                        tasks.extend(extra_tasks);
                         return Task::batch(tasks);
-                    } else if !image_tasks.is_empty() {
-                        return Task::batch(image_tasks);
+                    } else if !extra_tasks.is_empty() {
+                        return Task::batch(extra_tasks);
                     }
                 }
             }
@@ -416,6 +452,60 @@ impl cosmic::Application for App {
                 tracing::debug!("Favourite toggled for {room_id}");
             }
 
+            // -- Avatars --
+            Message::AvatarFetched { key, data } => {
+                self.avatars.insert(key, ImageHandle::from_bytes(data));
+            }
+            Message::AvatarFetchFailed { key } => {
+                tracing::warn!("Failed to fetch avatar {key}");
+            }
+            Message::OwnAvatarFetched(data) => {
+                self.own_avatar = Some(ImageHandle::from_bytes(data));
+            }
+
+            // -- Profile panel --
+            Message::ShowProfilePanel => {
+                self.show_profile_panel = true;
+            }
+            Message::CloseProfilePanel => {
+                self.show_profile_panel = false;
+            }
+            Message::PickAvatar => {
+                if let (Some(ref client), Some(ref uid)) = (&self.client, &self.own_user_id) {
+                    let client = Arc::clone(client);
+                    let uid = uid.clone();
+                    return cosmic::task::future(async move {
+                        pick_and_upload_avatar((*client).clone(), uid).await
+                    });
+                }
+            }
+            Message::AvatarUploaded => {
+                tracing::info!("Avatar uploaded");
+                if let Some(ref client) = self.client {
+                    let client = Arc::clone(client);
+                    return cosmic::task::future(async move {
+                        fetch_own_avatar((*client).clone()).await
+                    });
+                }
+            }
+            Message::AvatarUploadError(e) => {
+                tracing::error!("Avatar upload failed: {e}");
+            }
+            Message::ClearAvatar => {
+                if let Some(ref client) = self.client {
+                    let client = Arc::clone(client);
+                    return cosmic::task::future(async move {
+                        match (*client).account().set_avatar_url(None).await {
+                            Ok(_) => {
+                                tracing::info!("Avatar cleared");
+                                Message::AvatarUploaded
+                            }
+                            Err(e) => Message::AvatarUploadError(format!("Failed to clear avatar: {e}")),
+                        }
+                    });
+                }
+            }
+
             Message::LoadMoreHistory => {
                 let token = match self.timeline_state.pagination_token.clone() {
                     Some(t) => t,
@@ -438,8 +528,10 @@ impl cosmic::Application for App {
             }
             Message::HistoryLoaded(room_id, items, token) => {
                 if self.timeline_state.room_id.as_ref() == Some(&room_id) {
-                    let image_tasks = if let Some(ref client) = self.client {
-                        spawn_image_fetches(&items, &self.images, client)
+                    let extra_tasks = if let Some(ref client) = self.client {
+                        let mut t = spawn_image_fetches(&items, &self.images, client);
+                        t.extend(spawn_avatar_fetches_for_timeline(&items, &self.avatars, client));
+                        t
                     } else {
                         Vec::new()
                     };
@@ -450,8 +542,8 @@ impl cosmic::Application for App {
                     matrix::timeline::apply_continuation_markers(
                         &mut self.timeline_state.items,
                     );
-                    if !image_tasks.is_empty() {
-                        return Task::batch(image_tasks);
+                    if !extra_tasks.is_empty() {
+                        return Task::batch(extra_tasks);
                     }
                 }
             }
@@ -674,6 +766,9 @@ impl cosmic::Application for App {
                 };
                 vec![
                     widget::text::body(icon_label).into(),
+                    widget::button::text("Profile")
+                        .on_press(Message::ShowProfilePanel)
+                        .into(),
                     widget::button::text("Verify")
                         .on_press(Message::StartVerification)
                         .into(),
@@ -690,6 +785,19 @@ impl cosmic::Application for App {
 impl App {
     fn main_view(&self) -> Element<'_, Message> {
         let spacing = cosmic::theme::spacing();
+
+        // Profile panel overlay (shown when active)
+        if self.show_profile_panel {
+            let own_display = self
+                .own_user_id
+                .as_deref()
+                .map(|u| u.as_str())
+                .unwrap_or("");
+            return profile_ui::profile_panel_view(
+                own_display,
+                self.own_avatar.as_ref(),
+            );
+        }
 
         // Sidebar: room list
         let mut sidebar_col = widget::column()
@@ -771,15 +879,33 @@ impl App {
                         .spacing(spacing.space_xs)
                         .align_y(Alignment::Center);
 
-                    row = row.push(
-                        widget::container(widget::text::heading(
-                            room.avatar_letter.to_string(),
-                        ))
-                        .width(Length::Fixed(32.0))
-                        .height(Length::Fixed(32.0))
-                        .align_x(Alignment::Center)
-                        .align_y(Alignment::Center),
-                    );
+                    // Avatar: image if cached, otherwise initial-letter placeholder
+                    let avatar_handle = room
+                        .avatar_url
+                        .as_ref()
+                        .and_then(|url| self.avatars.get(url));
+
+                    if let Some(handle) = avatar_handle {
+                        row = row.push(
+                            widget::container(
+                                cosmic::iced::widget::image(handle.clone())
+                                    .width(Length::Fixed(32.0))
+                                    .height(Length::Fixed(32.0)),
+                            )
+                            .width(Length::Fixed(32.0))
+                            .height(Length::Fixed(32.0)),
+                        );
+                    } else {
+                        row = row.push(
+                            widget::container(widget::text::heading(
+                                room.avatar_letter.to_string(),
+                            ))
+                            .width(Length::Fixed(32.0))
+                            .height(Length::Fixed(32.0))
+                            .align_x(Alignment::Center)
+                            .align_y(Alignment::Center),
+                        );
+                    }
 
                     let mut info_col = widget::column().spacing(2);
                     if room.mention_count > 0 {
@@ -837,6 +963,7 @@ impl App {
                     room_list = room_list.push(btn);
                 }
             }
+
             sidebar_col =
                 sidebar_col.push(widget::scrollable(room_list).height(Length::Fill));
         }
@@ -893,11 +1020,14 @@ impl App {
         });
         let is_encrypted = selected_room.map(|r| r.is_encrypted).unwrap_or(false);
         let topic = selected_room.and_then(|r| r.topic.as_deref());
+        let room_avatar = selected_room
+            .and_then(|r| r.avatar_url.as_ref())
+            .and_then(|url| self.avatars.get(url));
 
-        let header = room_header::room_header_view(room_name, is_encrypted, topic);
+        let header = room_header::room_header_view(room_name, is_encrypted, topic, room_avatar);
 
         // Timeline
-        let timeline = timeline_ui::timeline_view(&self.timeline_state, &self.images);
+        let timeline = timeline_ui::timeline_view(&self.timeline_state, &self.images, &self.avatars);
 
         // Composer
         let composer = composer::composer_view(&self.timeline_state);
@@ -987,9 +1117,7 @@ async fn send_message(
 
 async fn pick_and_send_attachment(client: &Client, room_id: &OwnedRoomId) -> Message {
     use cosmic::dialog::file_chooser;
-    use matrix_sdk::attachment::AttachmentConfig;
 
-    // Open the native COSMIC file picker
     let response = match file_chooser::open::Dialog::new()
         .title("Choose a file to send")
         .open_file()
@@ -1024,7 +1152,7 @@ async fn pick_and_send_attachment(client: &Client, room_id: &OwnedRoomId) -> Mes
     };
 
     match room
-        .send_attachment(&filename, &mime, data, AttachmentConfig::new())
+        .send_attachment(&filename, &mime, data, matrix_sdk::attachment::AttachmentConfig::new())
         .await
     {
         Ok(_) => Message::AttachmentSent(room_id.clone()),
@@ -1032,7 +1160,71 @@ async fn pick_and_send_attachment(client: &Client, room_id: &OwnedRoomId) -> Mes
     }
 }
 
-/// Collect image fetch tasks for any image messages not yet in the cache.
+async fn pick_and_upload_avatar(client: Client, _uid: OwnedUserId) -> Message {
+    use cosmic::dialog::file_chooser;
+
+    let response = match file_chooser::open::Dialog::new()
+        .title("Choose a profile picture")
+        .open_file()
+        .await
+    {
+        Ok(r) => r,
+        Err(file_chooser::Error::Cancelled) => return Message::None,
+        Err(e) => return Message::AvatarUploadError(e.to_string()),
+    };
+
+    let path = match response.url().to_file_path() {
+        Ok(p) => p,
+        Err(_) => return Message::AvatarUploadError("Could not resolve file path".into()),
+    };
+
+    let mime = mime_guess::from_path(&path).first_or_octet_stream();
+    let data = match tokio::fs::read(&path).await {
+        Ok(d) => d,
+        Err(e) => return Message::AvatarUploadError(format!("Failed to read file: {e}")),
+    };
+
+    // Upload media
+    let upload_response = match client
+        .media()
+        .upload(&mime, data, None)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return Message::AvatarUploadError(format!("Upload failed: {e}")),
+    };
+
+    // Set avatar URL on profile
+    match client.account().set_avatar_url(Some(&upload_response.content_uri)).await {
+        Ok(_) => Message::AvatarUploaded,
+        Err(e) => Message::AvatarUploadError(format!("Failed to set avatar URL: {e}")),
+    }
+}
+
+async fn fetch_own_avatar(client: Client) -> Message {
+    let uri = match client.account().get_avatar_url().await {
+        Ok(Some(uri)) => uri,
+        _ => return Message::None,
+    };
+    let source = matrix_sdk::ruma::events::room::MediaSource::Plain(uri);
+    let size = MediaThumbnailSettings::new(
+        UInt::try_from(64u64).unwrap(),
+        UInt::try_from(64u64).unwrap(),
+    );
+    let request = MediaRequestParameters {
+        source,
+        format: MediaFormat::Thumbnail(size),
+    };
+    match client.media().get_media_content(&request, true).await {
+        Ok(data) => Message::OwnAvatarFetched(data),
+        Err(e) => {
+            tracing::warn!("Failed to fetch own avatar: {e}");
+            Message::None
+        }
+    }
+}
+
+/// Collect inline image fetch tasks for any image messages not yet in the cache.
 fn spawn_image_fetches(
     items: &[TimelineItem],
     images: &HashMap<String, ImageHandle>,
@@ -1054,6 +1246,76 @@ fn spawn_image_fetches(
         }
     }
     tasks
+}
+
+/// Collect avatar fetch tasks for sender avatars in timeline items not yet cached.
+fn spawn_avatar_fetches_for_timeline(
+    items: &[TimelineItem],
+    avatars: &HashMap<String, ImageHandle>,
+    client: &Arc<Client>,
+) -> Vec<cosmic::app::Task<Message>> {
+    let mut tasks = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in items {
+        if let TimelineItem::Message(msg) = item {
+            if let Some(ref url) = msg.sender_avatar_url {
+                if !avatars.contains_key(url) && seen.insert(url.clone()) {
+                    tasks.push(spawn_avatar_fetch(client.clone(), url.clone()));
+                }
+            }
+        }
+    }
+    tasks
+}
+
+/// Collect avatar fetch tasks for room avatars not yet cached.
+fn spawn_avatar_fetches_for_rooms(
+    rooms: &[crate::message::RoomEntry],
+    avatars: &HashMap<String, ImageHandle>,
+    client: &Arc<Client>,
+) -> Vec<cosmic::app::Task<Message>> {
+    let mut tasks = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for room in rooms {
+        if let Some(ref url) = room.avatar_url {
+            if !avatars.contains_key(url) && seen.insert(url.clone()) {
+                tasks.push(spawn_avatar_fetch(client.clone(), url.clone()));
+            }
+        }
+    }
+    tasks
+}
+
+fn spawn_avatar_fetch(client: Arc<Client>, mxc_url: String) -> cosmic::app::Task<Message> {
+    cosmic::task::future(async move {
+        fetch_avatar_data(client, mxc_url).await
+    })
+}
+
+async fn fetch_avatar_data(client: Arc<Client>, mxc_url: String) -> Message {
+    let uri: matrix_sdk::ruma::OwnedMxcUri = match mxc_url.as_str().try_into() {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!("Invalid mxc URI {mxc_url}: {e}");
+            return Message::AvatarFetchFailed { key: mxc_url };
+        }
+    };
+    let source = matrix_sdk::ruma::events::room::MediaSource::Plain(uri);
+    let size = MediaThumbnailSettings::new(
+        UInt::try_from(32u64).unwrap(),
+        UInt::try_from(32u64).unwrap(),
+    );
+    let request = MediaRequestParameters {
+        source,
+        format: MediaFormat::Thumbnail(size),
+    };
+    match client.media().get_media_content(&request, true).await {
+        Ok(data) => Message::AvatarFetched { key: mxc_url, data },
+        Err(e) => {
+            tracing::warn!("Avatar fetch failed for {mxc_url}: {e}");
+            Message::AvatarFetchFailed { key: mxc_url }
+        }
+    }
 }
 
 async fn fetch_image_data(
@@ -1084,7 +1346,7 @@ async fn load_more_history(
         None => return Message::HistoryLoaded(room_id.clone(), Vec::new(), None),
     };
 
-    let display_names = matrix::timeline::build_display_names(&room).await;
+    let (display_names, avatar_urls) = matrix::timeline::build_member_info(&room).await;
     let options = matrix_sdk::room::MessagesOptions::backward().from(Some(token));
     match room.messages(options).await {
         Ok(messages) => {
@@ -1107,7 +1369,7 @@ async fn load_more_history(
                     match ev {
                         AnySyncTimelineEvent::MessageLike(msg_ev) => {
                             if let Some(item) =
-                                matrix::timeline::convert_message_event(&msg_ev, &display_names)
+                                matrix::timeline::convert_message_event(&msg_ev, &display_names, &avatar_urls)
                             {
                                 items.push(item);
                             }
