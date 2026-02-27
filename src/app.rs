@@ -276,9 +276,37 @@ impl cosmic::Application for App {
 
                 if let Some(ref client) = self.client {
                     let client = client.clone();
-                    return cosmic::task::future(async move {
+                    let client2 = client.clone();
+                    let room_id2 = room_id.clone();
+                    // Check if room is encrypted and request backup keys if so
+                    let is_encrypted = self.rooms_state.rooms.iter()
+                        .find(|r| r.room_id == room_id)
+                        .map(|r| r.is_encrypted)
+                        .unwrap_or(false);
+                    let mut tasks = vec![cosmic::task::future(async move {
                         load_timeline_for_room(&client, &room_id).await
-                    });
+                    })];
+                    if is_encrypted {
+                        tasks.push(cosmic::task::future(async move {
+                            fetch_backup_keys_for_room(&client2, room_id2).await
+                        }));
+                    }
+                    return Task::batch(tasks);
+                }
+            }
+            Message::RetryDecryption(room_id) => {
+                if let Some(ref client) = self.client {
+                    let client = client.clone();
+                    let client2 = client.clone();
+                    let room_id2 = room_id.clone();
+                    return Task::batch(vec![
+                        cosmic::task::future(async move {
+                            fetch_backup_keys_for_room(&client, room_id).await
+                        }),
+                        cosmic::task::future(async move {
+                            load_timeline_for_room(&client2, &room_id2).await
+                        }),
+                    ]);
                 }
             }
             Message::RoomFilterChanged(val) => {
@@ -1089,7 +1117,7 @@ impl App {
         let header = room_header::room_header_view(room_name, is_encrypted, topic, room_avatar);
 
         // Timeline
-        let timeline = timeline_ui::timeline_view(&self.timeline_state, &self.images, &self.avatars);
+        let timeline = timeline_ui::timeline_view(&self.timeline_state, &self.images, &self.avatars, self.timeline_state.room_id.as_ref());
 
         // Composer
         let composer = composer::composer_view(&self.timeline_state);
@@ -1543,4 +1571,19 @@ fn send_batch_notification(room_name: &str, count: usize) {
             .timeout(notify_rust::Timeout::Milliseconds(5000))
             .show();
     });
+}
+
+async fn fetch_backup_keys_for_room(
+    client: &matrix_sdk::Client,
+    room_id: matrix_sdk::ruma::OwnedRoomId,
+) -> Message {
+    let backups = client.encryption().backups();
+    if backups.are_enabled().await {
+        if let Err(e) = backups.download_room_keys_for_room(&room_id).await {
+            tracing::warn!("Failed to download backup keys for {room_id}: {e}");
+        } else {
+            tracing::info!("Downloaded backup keys for {room_id}");
+        }
+    }
+    Message::None
 }

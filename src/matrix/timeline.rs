@@ -171,7 +171,7 @@ pub fn convert_message_event(
                 event_id: String::new(),
                 sender: String::new(),
                 sender_display: String::new(),
-                body: "[Unable to decrypt]".to_string(),
+                body: "🔐 Unable to decrypt".to_string(),
                 timestamp: String::new(),
                 is_emote: false,
                 is_continuation: false,

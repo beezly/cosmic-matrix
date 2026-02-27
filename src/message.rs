@@ -88,6 +88,7 @@ pub enum Message {
     ToggleFavourite(OwnedRoomId),
     FavouriteToggled(OwnedRoomId, bool),
     ToggleSection(String), // section key
+    RetryDecryption(OwnedRoomId),
 
     // -- Timeline --
     TimelineUpdated(OwnedRoomId, Vec<TimelineItem>, Option<String>),
