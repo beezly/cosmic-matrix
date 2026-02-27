@@ -58,6 +58,8 @@ pub struct App {
     own_avatar: Option<ImageHandle>,
     /// Whether the profile panel is visible.
     show_profile_panel: bool,
+    /// Suppresses notifications until the initial sync is complete.
+    initial_sync_done: bool,
 }
 
 impl cosmic::Application for App {
@@ -107,6 +109,7 @@ impl cosmic::Application for App {
             avatars: HashMap::new(),
             own_avatar: None,
             show_profile_panel: false,
+            initial_sync_done: false,
         };
 
         let task = if has_session {
@@ -321,7 +324,7 @@ impl cosmic::Application for App {
             Message::IncomingEvents(room_id, new_items) => {
                 // Desktop notifications for messages in non-active rooms
                 let is_active_room = self.timeline_state.room_id.as_ref() == Some(&room_id);
-                if !is_active_room {
+                if !is_active_room && self.initial_sync_done {
                     let own_id = self.own_user_id.as_ref().map(|u| u.to_string()).unwrap_or_default();
                     let room_name = self.rooms_state.rooms.iter()
                         .find(|r| r.room_id == room_id)
