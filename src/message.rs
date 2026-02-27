@@ -114,6 +114,20 @@ pub enum Message {
     ImageFetched { event_id: String, data: Vec<u8> },
     ImageFetchFailed { event_id: String },
 
+    // -- Avatars --
+    /// key is the mxc:// URI string
+    AvatarFetched { key: String, data: Vec<u8> },
+    AvatarFetchFailed { key: String },
+    OwnAvatarFetched(Vec<u8>),
+
+    // -- Profile panel --
+    ShowProfilePanel,
+    CloseProfilePanel,
+    PickAvatar,
+    AvatarUploaded,
+    AvatarUploadError(String),
+    ClearAvatar,
+
     // -- Cross-signing bootstrap --
     BootstrapCrossSigning,
     CrossSigningBootstrapped,
@@ -163,6 +177,8 @@ pub struct RoomEntry {
     pub is_low_priority: bool,
     /// Room is a direct message (appears in m.direct account data).
     pub is_dm: bool,
+    /// mxc:// URI for the room avatar, if set.
+    pub avatar_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -193,4 +209,6 @@ pub struct TimelineMessage {
     pub reply_to_body: Option<String>,
     /// Present when this message is an image (m.image).
     pub image: Option<ImageContent>,
+    /// mxc:// URI for the sender's avatar, if available.
+    pub sender_avatar_url: Option<String>,
 }
