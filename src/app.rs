@@ -58,6 +58,8 @@ pub struct App {
     own_avatar: Option<ImageHandle>,
     /// Whether the profile panel is visible.
     show_profile_panel: bool,
+    /// Suppresses notifications until the initial sync is complete.
+    initial_sync_done: bool,
 }
 
 impl cosmic::Application for App {
@@ -107,6 +109,7 @@ impl cosmic::Application for App {
             avatars: HashMap::new(),
             own_avatar: None,
             show_profile_panel: false,
+            initial_sync_done: false,
         };
 
         let task = if has_session {
@@ -319,6 +322,35 @@ impl cosmic::Application for App {
                 }
             }
             Message::IncomingEvents(room_id, new_items) => {
+                // Desktop notifications for messages in non-active rooms
+                let is_active_room = self.timeline_state.room_id.as_ref() == Some(&room_id);
+                if !is_active_room && self.initial_sync_done {
+                    let own_id = self.own_user_id.as_ref().map(|u| u.to_string()).unwrap_or_default();
+                    let room_name = self.rooms_state.rooms.iter()
+                        .find(|r| r.room_id == room_id)
+                        .map(|r| r.name.clone())
+                        .unwrap_or_else(|| room_id.to_string());
+                    let notifiable: Vec<(String, String)> = new_items.iter().filter_map(|item| {
+                        if let crate::message::TimelineItem::Message(msg) = item {
+                            if msg.sender != own_id && !msg.event_id.is_empty() {
+                                let body = if msg.image.is_some() {
+                                    "📷 Image".to_string()
+                                } else {
+                                    msg.body.chars().take(100).collect()
+                                };
+                                return Some((msg.sender_display.clone(), body));
+                            }
+                        }
+                        None
+                    }).collect();
+                    if notifiable.len() == 1 {
+                        let (ref sender, ref body) = notifiable[0];
+                        send_notification(&room_name, sender, body);
+                    } else if notifiable.len() > 1 {
+                        send_batch_notification(&room_name, notifiable.len());
+                    }
+                }
+
                 if self.timeline_state.room_id.as_ref() == Some(&room_id) {
                     if !self.timeline_state.at_bottom
                         && !self.timeline_state.unread_marker_inserted
@@ -1483,4 +1515,32 @@ async fn send_read_receipt(
             .await;
     }
     Message::None
+}
+
+/// Send a desktop notification in a background thread to avoid blocking the executor.
+/// Batches multiple messages: if count > 1, shows a summary instead of individual messages.
+fn send_notification(room_name: &str, sender: &str, body: &str) {
+    let summary = room_name.to_string();
+    let full_body = format!("{sender}: {body}");
+    std::thread::spawn(move || {
+        let _ = notify_rust::Notification::new()
+            .summary(&summary)
+            .body(&full_body)
+            .icon("com.cosmic.CosmicMatrix")
+            .timeout(notify_rust::Timeout::Milliseconds(5000))
+            .show();
+    });
+}
+
+fn send_batch_notification(room_name: &str, count: usize) {
+    let summary = room_name.to_string();
+    let body = format!("{count} new messages");
+    std::thread::spawn(move || {
+        let _ = notify_rust::Notification::new()
+            .summary(&summary)
+            .body(&body)
+            .icon("com.cosmic.CosmicMatrix")
+            .timeout(notify_rust::Timeout::Milliseconds(5000))
+            .show();
+    });
 }
