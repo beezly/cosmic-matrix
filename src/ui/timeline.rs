@@ -17,6 +17,7 @@ pub static TIMELINE_SCROLLABLE_ID: LazyLock<Id> =
 pub fn timeline_view<'a>(
     state: &'a TimelineState,
     images: &'a HashMap<String, ImageHandle>,
+    avatars: &'a HashMap<String, ImageHandle>,
 ) -> Element<'a, Message> {
     let spacing = cosmic::theme::spacing();
 
@@ -51,7 +52,7 @@ pub fn timeline_view<'a>(
         );
     } else {
         for item in &state.items {
-            col = col.push(render_timeline_item(item, images));
+            col = col.push(render_timeline_item(item, images, avatars));
         }
     }
 
@@ -66,11 +67,12 @@ pub fn timeline_view<'a>(
 fn render_timeline_item<'a>(
     item: &'a TimelineItem,
     images: &'a HashMap<String, ImageHandle>,
+    avatars: &'a HashMap<String, ImageHandle>,
 ) -> Element<'a, Message> {
     let spacing = cosmic::theme::spacing();
 
     match item {
-        TimelineItem::Message(msg) => render_message(msg, images),
+        TimelineItem::Message(msg) => render_message(msg, images, avatars),
         TimelineItem::DateSeparator(date) => {
             widget::container(
                 widget::row()
@@ -117,12 +119,56 @@ fn render_timeline_item<'a>(
 fn render_message<'a>(
     msg: &'a TimelineMessage,
     images: &'a HashMap<String, ImageHandle>,
+    avatars: &'a HashMap<String, ImageHandle>,
 ) -> Element<'a, Message> {
     let spacing = cosmic::theme::spacing();
 
+    // Show sender header + avatar for non-continuations, or when message is a reply
+    let show_header = !msg.is_continuation || msg.reply_to_sender.is_some();
+
+    // Avatar column (32px wide): show avatar on first message of a group, blank space on continuations
+    let avatar_col = if show_header {
+        let avatar_handle = msg
+            .sender_avatar_url
+            .as_ref()
+            .and_then(|url| avatars.get(url));
+        let avatar_elem: Element<_> = if let Some(handle) = avatar_handle {
+            cosmic::iced::widget::image(handle.clone())
+                .width(Length::Fixed(32.0))
+                .height(Length::Fixed(32.0))
+                .into()
+        } else {
+            // Placeholder: coloured initial letter
+            let initial = msg
+                .sender_display
+                .chars()
+                .next()
+                .unwrap_or('?')
+                .to_uppercase()
+                .to_string();
+            let col = colors::sender_color(&msg.sender);
+            widget::container(
+                widget::text::body(initial).class(col),
+            )
+            .width(Length::Fixed(32.0))
+            .height(Length::Fixed(32.0))
+            .align_x(Alignment::Center)
+            .align_y(Alignment::Center)
+            .into()
+        };
+        widget::container(avatar_elem)
+            .width(Length::Fixed(32.0))
+            .align_y(Alignment::Start)
+    } else {
+        // Blank spacer to keep message text aligned under the avatar
+        widget::container(widget::horizontal_space().width(Length::Fixed(32.0)))
+            .width(Length::Fixed(32.0))
+            .align_y(Alignment::Start)
+    };
+
     let mut col = widget::column().spacing(2);
 
-    // Reply quote block (always shown, even for continuations)
+    // Reply quote block
     if let (Some(ref sender_id), Some(ref preview)) =
         (&msg.reply_to_sender, &msg.reply_to_body)
     {
@@ -150,8 +196,8 @@ fn render_message<'a>(
         col = col.push(quote_block);
     }
 
-    // Show sender header for non-continuations, or always when message is a reply
-    if !msg.is_continuation || msg.reply_to_sender.is_some() {
+    // Sender name + timestamp header
+    if show_header {
         let sender_col = colors::sender_color(&msg.sender);
         let mut header = widget::row().spacing(spacing.space_xs);
         if msg.is_emote {
@@ -179,6 +225,23 @@ fn render_message<'a>(
                 .padding([0, spacing.space_xxs]),
         );
         col = col.push(header);
+    } else {
+        // Continuation — still show the reply button
+        let reply_ctx = ReplyContext {
+            event_id: msg.event_id.clone(),
+            sender_id: msg.sender.clone(),
+            sender_display: msg.sender_display.clone(),
+            body_preview: msg.body.chars().take(80).collect(),
+        };
+        col = col.push(
+            widget::row()
+                .push(widget::horizontal_space())
+                .push(
+                    widget::button::text("↩")
+                        .on_press(Message::ReplyTo(reply_ctx))
+                        .padding([0, spacing.space_xxs]),
+                ),
+        );
     }
 
     // Render image or text body
@@ -192,7 +255,6 @@ fn render_message<'a>(
         } else {
             col = col.push(widget::text::caption("[Loading image...]"));
         }
-        // Show filename as a subtle caption
         if !msg.body.is_empty() {
             col = col.push(widget::text::caption(msg.body.as_str()));
         }
@@ -206,8 +268,15 @@ fn render_message<'a>(
         spacing.space_xxs
     };
 
-    widget::container(col)
-        .padding([top_pad, spacing.space_s])
-        .width(Length::Fill)
-        .into()
+    widget::container(
+        widget::row()
+            .push(avatar_col)
+            .push(widget::horizontal_space().width(Length::Fixed(spacing.space_xs as f32)))
+            .push(widget::container(col).width(Length::Fill))
+            .spacing(0)
+            .align_y(Alignment::Start),
+    )
+    .padding([top_pad, spacing.space_s])
+    .width(Length::Fill)
+    .into()
 }
